@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+*.aux
+*.log
+*.out
+*.toc
+build/
+
+# Generated figures.  mfestyle.out() writes fig*.pdf beside the repository root,
+# so a reader who follows the README ("MFE_MODE=colour python figs/make_fig33.py")
+# lands 84 untracked PDFs here and can commit them by accident.  Four stale ones
+# were committed under figs/ that way, and a stale committed figure is worse than
+# no figure: it silently replaces the one the generator just rebuilt.
+fig*.pdf
