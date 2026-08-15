@@ -1,0 +1,139 @@
+name: ci
+on:
+  # BOTH branches.  The `solutions` job below is gated on
+  # `github.ref == 'refs/heads/solutions'`, and while this trigger listed main
+  # alone that job could never fire: a push to solutions did not start the
+  # workflow at all.  Appendix C promises in print that the solutions branch is
+  # "covered by the same CI job as main", so this line is load-bearing.
+  push: {branches: [main, solutions]}
+  pull_request:
+  schedule: [{cron: "0 6 * * 1"}]   # weekly, so drift is caught without a commit
+
+jobs:
+  arithmetic:
+    # Every number printed in an arithmetic box, recomputed.  This job is the
+    # reason the book and the repository cannot disagree.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install numpy scipy pytest
+      # Two suites, one contract: every number the book prints is recomputed
+      # here.  test_arithmetic.py covers the chapters, test_appendix_c.py the
+      # solutions, which went unguarded until nine of them turned out wrong.
+      - run: python -m pytest exercises/test_arithmetic.py exercises/test_appendix_c.py -q
+
+  notebooks:
+    # Every notebook executed top to bottom.  A notebook whose assertions no
+    # longer hold fails the build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt
+      # `jupyter execute --inplace=false` is rejected as an argument error by the
+      # pinned nbclient, so this job used to fail before running a single cell.
+      # Drive nbclient directly instead: it is what jupyter execute wraps, it
+      # never writes the notebook back, and a failing assertion surfaces as a
+      # non-zero exit with the traceback.
+      - run: |
+          python - <<'PY'
+          import glob, sys, nbformat, nbclient
+          bad = []
+          for p in sorted(glob.glob("notebooks/ch*.ipynb")):
+              nb = nbformat.read(p, as_version=4)
+              try:
+                  nbclient.NotebookClient(
+                      nb, timeout=900, kernel_name="python3",
+                      resources={"metadata": {"path": "notebooks"}}).execute()
+                  print("ok  ", p)
+              except Exception as exc:
+                  bad.append(p); print("FAIL", p, exc)
+          sys.exit(1 if bad else 0)
+          PY
+      # Every section must assert.  A notebook that prints and checks nothing
+      # passes execution and proves nothing, which is the failure mode this
+      # whole job exists to prevent.
+      - run: |
+          python - <<'PY'
+          import glob, json, sys
+          bad = []
+          for p in sorted(glob.glob("notebooks/ch*.ipynb")):
+              cells = [c for c in json.load(open(p))["cells"]
+                       if c["cell_type"] == "code"][1:]      # skip the preamble
+              for i, c in enumerate(cells, 1):
+                  if "assert" not in "".join(c["source"]):
+                      bad.append(f"{p} section cell {i} asserts nothing")
+          print("\n".join(bad) or "every section asserts")
+          sys.exit(1 if bad else 0)
+          PY
+
+  figures:
+    # Both output modes, so a figure that only works in colour fails here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      # The figures must be set in Libertinus, the same face as the body text.
+      # figs/mfestyle.py now STOPS rather than substituting DejaVu, which is what
+      # it silently did for every figure in the book until 15 Aug 2026.  So this
+      # job installs the font, and a runner without it fails loudly here instead
+      # of producing 84 quietly wrong PDFs.
+      - run: sudo apt-get update && sudo apt-get install -y fonts-libertinus
+      - run: pip install numpy matplotlib
+      - run: |
+          for f in figs/make_fig*.py; do
+            MFE_MODE=colour python "$f"
+            MFE_MODE=print  python "$f"
+          done
+      # and no figure may carry a Type 3 font: it is a rasterised format some
+      # print vendors reject, and matplotlib emits it by default.
+      - run: sudo apt-get install -y poppler-utils
+      - run: |
+          bad=0
+          for f in fig*.pdf; do
+            if pdffonts "$f" | tail -n +3 | grep -q "Type 3"; then
+              echo "$f embeds a Type 3 font"; bad=1
+            fi
+            if ! pdffonts "$f" | grep -q Libertinus; then
+              echo "$f is not set in Libertinus"; bad=1
+            fi
+          done
+          exit $bad
+
+  measurement-manifest:
+    # The three checkpoint-derived figures rebuild from committed statistics, so
+    # CI never downloads a model.  What it does check is that the statistics are
+    # present and pinned: an unpinned manifest is not a reproducible measurement.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: |
+          if [ -f measure/data/manifest.json ]; then
+            python - <<'PY'
+          import json, sys
+          m = json.load(open("measure/data/manifest.json"))
+          if m["revision"] == "unpinned":
+              sys.exit("manifest records an unpinned revision; re-run with --revision")
+          print("measurement pinned to", m["model"], "@", m["revision"][:12])
+          PY
+          else
+            echo "no measurement yet; F-2.4, F-3.5 and F-5.1 are still synthetic"
+          fi
+
+  solutions:
+    # Runs only on the solutions branch.  On main the exercise tests are meant
+    # to fail: that is the exercise.
+    if: github.ref == 'refs/heads/solutions'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt
+      - run: python -m pytest exercises -q
