@@ -1,8 +1,15 @@
 """Your solutions for Chapter 14's [C] exercises.
 
-Every function raises NotImplementedError, so every test in this directory
-fails on a fresh clone.  Making them pass is the exercise.
+THIS IS THE `solutions` BRANCH.  Every function below is worked in full and
+every test in this directory passes.  On `main` these are stubs raising
+NotImplementedError, and making them pass is the exercise; read this file only
+after you have had a go, or when you want to compare a method rather than an
+answer.  Appendix C prints the answer and the tolerance, not the code.
 """
+import numpy as np
+from scipy.special import logsumexp
+
+from arith.decoding import tokens_per_round
 
 
 # ------------------------------------------------------------------- E-14.3
@@ -15,7 +22,9 @@ def temper(z, T):
     note is about exactly this: fp16 logits spanning more than about 11
     saturate before the mathematics says they should.
     """
-    raise NotImplementedError
+    u = np.asarray(z, dtype=np.float64) / float(T)
+    e = np.exp(u - u.max())
+    return e / e.sum()
 
 
 def entropy(z, T):
@@ -23,8 +32,17 @@ def entropy(z, T):
 
     Note that 0 log 0 is 0.  A vector with a near-certain token will produce
     probabilities that underflow, and the naive expression returns nan.
+
+    Method note.  Writing H = log Z(T) - E_p[z] / T, with log Z by log-sum-exp,
+    removes the problem rather than patching it: no logarithm of a probability
+    is ever taken, so an underflowed coordinate contributes an exact zero
+    instead of a nan.  At an m-fold tie in the argmax it returns log m as
+    T -> 0, which is the limit D-14.1 step 7 needs its genericity hypothesis
+    for.
     """
-    raise NotImplementedError
+    u = np.asarray(z, dtype=np.float64) / float(T)
+    p = temper(z, T)
+    return float(logsumexp(u) - p @ u)
 
 
 def dentropy_dT(z, T):
@@ -35,7 +53,11 @@ def dentropy_dT(z, T):
     mis-calibrates.  Get the power right: T**2 agrees with T**3 at T = 1 and
     nowhere else.
     """
-    raise NotImplementedError
+    z = np.asarray(z, dtype=np.float64)
+    p = temper(z, T)
+    mean = p @ z
+    var = p @ (z - mean) ** 2
+    return float(var / float(T) ** 3)
 
 
 # ------------------------------------------------------------------ E-14.11
@@ -46,7 +68,11 @@ def top_k(p, k):
     small numbers: that is what makes truncation a projection onto a face
     rather than another reshaping.
     """
-    raise NotImplementedError
+    p = np.asarray(p, dtype=np.float64)
+    out = np.zeros_like(p)
+    keep = np.argpartition(-p, k - 1)[:k]
+    out[keep] = p[keep]
+    return out / out.sum()
 
 
 def top_p(p, thr):
@@ -60,7 +86,16 @@ def top_p(p, thr):
     Off-by-one here is the classic bug and it is silent, because the result is
     still a valid distribution.
     """
-    raise NotImplementedError
+    p = np.asarray(p, dtype=np.float64)
+    order = np.argsort(-p)
+    cum = np.cumsum(p[order])
+    # the first position whose cumulative mass reaches the threshold, included
+    cut = int(np.searchsorted(cum, thr))
+    cut = min(cut, len(p) - 1)
+    out = np.zeros_like(p)
+    keep = order[:cut + 1]
+    out[keep] = p[keep]
+    return out / out.sum()
 
 
 def min_p(p, tau):
@@ -71,7 +106,9 @@ def min_p(p, tau):
     Implementing it directly on p is fine; knowing it is a logit window is what
     the exercise is for.
     """
-    raise NotImplementedError
+    p = np.asarray(p, dtype=np.float64)
+    out = np.where(p >= tau * p.max(), p, 0.0)
+    return out / out.sum()
 
 
 def compose(z, T, rule, arg, temperature_first=True):
@@ -86,7 +123,15 @@ def compose(z, T, rule, arg, temperature_first=True):
     The two orders give different supports AND different odds among the
     survivors.  E-14.11 asks you to show that.
     """
-    raise NotImplementedError
+    z = np.asarray(z, dtype=np.float64)
+    truncate = {"top_k": top_k, "top_p": top_p, "min_p": min_p}[rule]
+    if temperature_first:
+        return truncate(temper(z, T), arg)
+    keep = truncate(temper(z, 1.0), arg) > 0
+    out = np.zeros_like(z)
+    # re-tempering the survivors is a softmax over their logits alone
+    out[keep] = temper(z[keep], T)
+    return out
 
 
 # ------------------------------------------------------------------ E-14.12
@@ -104,10 +149,22 @@ def beam_scores(candidates, rho=0.6):
     The 5 and the 6 are fitted constants from a machine-translation system.
     Nothing derives them.  That is the point of the exercise.
     """
-    raise NotImplementedError
+    out = {"unnormalised": [], "mean": [], "lp": []}
+    for c in candidates:
+        n = len(c)
+        s = float(np.sum(c))
+        out["unnormalised"].append(s)
+        out["mean"].append(s / n)
+        out["lp"].append(s / ((5.0 + n) / 6.0) ** rho)
+    return out
 
 
 # ------------------------------------------------------------------ E-14.13
+def _draw(dist, rng, n):
+    """n independent draws from a categorical distribution, by inverse CDF."""
+    return np.searchsorted(np.cumsum(dist), rng.random(n))
+
+
 def speculative_emit(p, q, rng, n):
     """Draw n tokens by the sampler of D-14.3, and return them as an array.
 
@@ -119,7 +176,15 @@ def speculative_emit(p, q, rng, n):
     E-14.13 asks you to demonstrate that by a chi-squared test, not to take it
     on trust.
     """
-    raise NotImplementedError
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    x = _draw(q, rng, n)
+    accept = rng.random(n) < np.minimum(1.0, p[x] / q[x])
+    residual = np.maximum(p - q, 0.0)
+    total = residual.sum()
+    # p == q accepts everything, and then the residual is never consulted
+    residual = residual / total if total > 0 else p.copy()
+    return np.where(accept, x, _draw(residual, rng, n))
 
 
 def speculative_emit_broken(p, q, rng, n):
@@ -130,7 +195,11 @@ def speculative_emit_broken(p, q, rng, n):
     chi-squared test should reject it decisively at the same sample size that
     leaves `speculative_emit` alone.
     """
-    raise NotImplementedError
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    x = _draw(q, rng, n)
+    accept = rng.random(n) < np.minimum(1.0, p[x] / q[x])
+    return np.where(accept, x, _draw(p, rng, n))
 
 
 def expected_tokens(alpha, gamma):
@@ -139,5 +208,9 @@ def expected_tokens(alpha, gamma):
     Derive it rather than looking it up: P(N >= k) = alpha**k for k <= gamma, a
     tail sum gives E[N], and exactly one further token is emitted in either
     branch, which is why the sum runs from zero.
+
+    The book prints this number, so it delegates to arith.decoding: the tail
+    sum Sum_{k=0..gamma} alpha**k in closed form, with the alpha = 1 limit
+    handled separately.
     """
-    raise NotImplementedError
+    return tokens_per_round(float(alpha), int(gamma))

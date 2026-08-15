@@ -1,7 +1,10 @@
 """Your solutions for Chapter 11's [C] exercises.
 
-Every function raises NotImplementedError, so every test in this directory
-fails on a fresh clone.  Making them pass is the exercise.
+THIS IS THE `solutions` BRANCH.  Every function below is worked in full and
+every test in this directory passes.  On `main` these are stubs raising
+NotImplementedError, and making them pass is the exercise; read this file only
+after you have had a go, or when you want to compare a method rather than an
+answer.  Appendix C prints the answer and the tolerance, not the code.
 
 Three of the four are exact reformulations: the answer they compute is the same
 answer the obvious implementation computes, and the tests say so with a
@@ -9,6 +12,7 @@ tolerance rather than an equality.  Read the docstring of
 `test_online_softmax.py` for why that distinction is the point of the chapter
 and not a concession.
 """
+import numpy as np
 
 
 def online_softmax_attention(z, v, n_blocks):
@@ -29,7 +33,29 @@ def online_softmax_attention(z, v, n_blocks):
     accumulator by the same scalar factor as the denominator, which is correct
     by linearity and is step 6 of D-11.4.
     """
-    raise NotImplementedError
+    z = np.asarray(z)
+    v = np.asarray(v)
+    s = z.shape[0]
+
+    m = -np.finfo(np.float64).max        # finite, so exp(m - m_new) is 0 and not NaN
+    l = 0.0                              # running denominator
+    o = np.zeros(v.shape[1], dtype=np.float64)   # running numerator
+
+    edges = np.linspace(0, s, n_blocks + 1).astype(int)
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if hi <= lo:                     # more blocks than positions
+            continue
+        zb, vb = z[lo:hi], v[lo:hi]      # the only block-sized arrays
+
+        m_new = max(m, float(zb.max()))          # (11.12)
+        rescale = np.exp(m - m_new)              # what the old triple is worth now
+        p = np.exp(zb - m_new)                   # this block's unnormalised weights
+
+        l = rescale * l + float(p.sum())         # (11.13)
+        o = rescale * o + p @ vb                 # (11.14), the same scalar factor
+        m = m_new
+
+    return o / l
 
 
 def mla_logits(X, C, W_q, W_uk, absorbed):
@@ -48,7 +74,12 @@ def mla_logits(X, C, W_q, W_uk, absorbed):
     Return the (n_q, n_k) logits.  The test asserts the two agree and that the
     absorbed path never allocates an array of the materialised key's shape.
     """
-    raise NotImplementedError
+    if not absorbed:
+        K = C @ W_uk                     # (n_k, d_h), the materialised keys
+        return (X @ W_q) @ K.T
+
+    W_tilde = W_q @ W_uk.T               # (d, d_c), a load-time constant
+    return (X @ W_tilde) @ C.T           # widest intermediate is (n_q, d_c)
 
 
 def decoupled_rope_logits(x_i, x_j, c_j, W_q, W_uk, W_qr, W_kr, i, j,
@@ -77,7 +108,33 @@ def decoupled_rope_logits(x_i, x_j, c_j, W_q, W_uk, W_qr, W_kr, i, j,
     The test checks that the result depends on i and j only through i - j,
     which is what the construction exists to guarantee.
     """
-    raise NotImplementedError
+    d_h = W_q.shape[1]
+    d_r = W_qr.shape[1]
+
+    # the compressed term: no rotation, so W_q W_uk^T stays absorbable
+    content = (x_i @ (W_q @ W_uk.T)) @ c_j
+
+    # the decoupled term: two narrow vectors, each rotated at its own position
+    q_r = _rope(x_i @ W_qr, i, base)
+    k_r = _rope(x_j @ W_kr, j, base)
+    rotated = float(q_r @ k_r)           # R_i R_j^T depends only on i - j
+
+    return float((content + rotated) / np.sqrt(d_h + d_r))
+
+
+def _rope(x, pos, base=10000.0):
+    """§4.3's rotation applied to one vector of even width, in place of forming
+    the (d_r, d_r) matrix.  Coordinates are paired (0,1), (2,3), ... and pair p
+    turns by pos * base^(-2p/d_r)."""
+    x = np.asarray(x, dtype=np.float64)
+    d = x.shape[-1]
+    theta = pos * base ** (-np.arange(0, d, 2) / d)
+    cos, sin = np.cos(theta), np.sin(theta)
+    even, odd = x[0::2], x[1::2]
+    out = np.empty_like(x)
+    out[0::2] = even * cos - odd * sin
+    out[1::2] = even * sin + odd * cos
+    return out
 
 
 def topk_recall(true_scores, approx_scores, k):
@@ -96,5 +153,22 @@ def topk_recall(true_scores, approx_scores, k):
     with a small attention weight costs nothing; a missed key with a large one
     may cost everything, and this statistic cannot tell you which happened.
     The exercise asks you to say so.
+
+    Any leading axes are flattened into the query axis, so a stack of per-head
+    or per-layer score matrices is scored as one pool of rows.  That is the
+    right pooling for this statistic: every row is one query's selection
+    problem, whichever head posed it.
     """
-    raise NotImplementedError
+    true = np.asarray(true_scores, dtype=np.float64).reshape(-1, np.shape(true_scores)[-1])
+    approx = np.asarray(approx_scores, dtype=np.float64).reshape(true.shape)
+
+    hits = []
+    for t_row, a_row in zip(true, approx):
+        valid = np.isfinite(t_row)
+        if valid.sum() < k:              # no meaningful top-k: skip, do not score
+            continue
+        top_true = np.argpartition(-t_row, k - 1)[:k]
+        top_approx = np.argpartition(-a_row, k - 1)[:k]
+        hits.append(len(np.intersect1d(top_true, top_approx, assume_unique=True)) / k)
+
+    return float(np.mean(hits)) if hits else 0.0

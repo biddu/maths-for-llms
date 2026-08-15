@@ -1,12 +1,24 @@
 """Your solutions for Chapter 12's [C] exercises.
 
-Every function raises NotImplementedError, so every test in this directory
-fails on a fresh clone.  Making them pass is the exercise.
+THIS IS THE `solutions` BRANCH.  Every function below is worked in full and
+every test in this directory passes.  On `main` these are stubs raising
+NotImplementedError, and making them pass is the exercise; read this file only
+after you have had a go, or when you want to compare a method rather than an
+answer.  Appendix C prints the answer and the tolerance, not the code.
 
 The three are the chapter in miniature: a router that makes a discrete choice
 differentiable, a loss that measures how badly that choice is distributed, and
 a controller that fixes the distribution without touching the objective.
 """
+import numpy as np
+
+
+def _softmax(z):
+    """Row-wise softmax, max-subtracted.  (12.1) as written is exp z / sum exp
+    z; subtracting the row maximum first is the same function and is what
+    §8.4 requires of any implementation of it."""
+    e = np.exp(z - z.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
 
 
 def route(z, k):
@@ -21,8 +33,22 @@ def route(z, k):
     test can check is that you renormalised over the *selected* set rather
     than over all E: dividing by the full softmax sum leaves gates summing to
     less than one, which trains, and quietly destroys D-12.1.
+
+    Selection is on the logits, by partial sort, and never on the gates.  The
+    two orderings agree here because the softmax is monotone, but the bias of
+    (12.8) is added to the logits for selection only, and at that point an
+    implementation that ranked gates would be ranking the wrong array.
     """
-    raise NotImplementedError
+    z = np.asarray(z, dtype=np.float64)
+    idx = np.argpartition(-z, k - 1, axis=1)[:, :k]      # the k largest logits
+    # order the selection by decreasing logit, so the columns mean something
+    order = np.argsort(-np.take_along_axis(z, idx, axis=1), axis=1)
+    idx = np.take_along_axis(idx, order, axis=1)
+
+    g = _softmax(z)                                      # (12.1), over all E
+    sel = np.take_along_axis(g, idx, axis=1)
+    ghat = sel / sel.sum(axis=1, keepdims=True)          # (12.2), over the k
+    return idx, ghat
 
 
 def aux_loss(z, idx, alpha_aux):
@@ -40,7 +66,21 @@ def aux_loss(z, idx, alpha_aux):
     minimising something other than what (12.6) says.  The analytic gradient
     is (12.7); deriving it is E-12.1.
     """
-    raise NotImplementedError
+    z = np.asarray(z, dtype=np.float64)
+    idx = np.asarray(idx)
+    T, E = z.shape
+
+    f = np.bincount(idx.ravel(), minlength=E) / idx.size     # the load, a count
+    g = _softmax(z)
+    P = g.mean(axis=0)                                       # the mean gate
+
+    loss = float(alpha_aux * E * (f @ P))
+
+    # (12.7).  The softmax Jacobian applied to f: expert j is pushed down when
+    # its load exceeds this token's own probability-weighted mean load.
+    weighted_mean = (g * f[None, :]).sum(axis=1, keepdims=True)
+    grad = (alpha_aux * E / T) * g * (f[None, :] - weighted_mean)
+    return loss, grad
 
 
 def bias_controller(loads_fn, E, k, u, steps, gamma0=None):
@@ -58,5 +98,21 @@ def bias_controller(loads_fn, E, k, u, steps, gamma0=None):
     Note what is *not* here: no gradient, no optimiser, no autograd.  The bias
     is outside the graph by construction, which is step 1 of D-12.3 and the
     whole reason the scheme costs the objective nothing.
+
+    Each row of the history is the error measured at the gamma that step
+    started from, so row 0 is the imbalance of the unbiased router.  The step
+    is a fixed magnitude u in the sign direction, which is why the error does
+    not converge to zero but to a limit cycle of amplitude of order u times the
+    plant gain: step 7 of D-12.3.
     """
-    raise NotImplementedError
+    gamma = np.zeros(E, dtype=np.float64) if gamma0 is None \
+        else np.array(gamma0, dtype=np.float64)
+    target = 1.0 / E
+
+    history = np.empty((steps, E), dtype=np.float64)
+    for t in range(steps):
+        error = target - np.asarray(loads_fn(gamma), dtype=np.float64)
+        history[t] = error
+        gamma = gamma + u * np.sign(error)           # (12.8), sign not gradient
+
+    return gamma, history
