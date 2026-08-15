@@ -1,0 +1,28 @@
+{
+  "sample_bytes": 33192,
+  "sample_sha256": "9669bacfde8e19b19546abd9040bdb7c26b645a53e74a27b3ae065e9f6210a73",
+  "source": "measure/sample.txt",
+  "rows": [
+    {
+      "name": "GPT-2",
+      "repo": "gpt2",
+      "vocab": 50257,
+      "tokens": 9407,
+      "bytes_per_token": 3.528436270862124
+    },
+    {
+      "name": "SmolLM2",
+      "repo": "HuggingFaceTB/SmolLM2-135M",
+      "vocab": 49152,
+      "tokens": 8735,
+      "bytes_per_token": 3.7998855180309103
+    },
+    {
+      "name": "Llama-3",
+      "repo": "Xenova/llama-3-tokenizer",
+      "vocab": 128000,
+      "tokens": 8136,
+      "bytes_per_token": 4.079646017699115
+    }
+  ]
+}
