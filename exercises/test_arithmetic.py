@@ -1,5 +1,7 @@
 """The CI guard.  Every number printed in an arithmetic box is recomputed here,
 so the print edition and the repository cannot drift apart."""
+import pytest
+
 from arith.model_d import (MODEL_D, non_embedding, embedding, total_params,
                            per_layer, attention_params, attention_flops, crossover,
                            rope_bands, critical_dimension, norm_stats,
@@ -1200,3 +1202,422 @@ def test_chapter13_nf4_levels_and_ordering():
     mse_int4 = float(((xn - to(np.linspace(-1, 1, 16), xn)) ** 2).mean())
     mse_nf4 = float(((xn - to(lv, xn)) ** 2).mean())
     assert mse_nf4 < 0.6 * mse_int4, (mse_nf4, mse_int4)
+
+
+# ============================================================ Chapter 14
+def test_chapter14_speculative_arithmetic():
+    """A-14.1, every printed figure.  The two the blueprint's own editorial
+    pass corrected (2.3056 tokens and 1.54x at alpha = 0.6) are here too."""
+    from arith.decoding import (best_gamma, break_even_c, speedup,
+                                tokens_per_round)
+    c = 1 / 8
+    assert round(tokens_per_round(0.8, 4), 4) == 3.3616
+    assert round(1 - 0.8 ** 5, 5) == 0.67232
+    assert round(speedup(0.8, 4, c), 4) == 2.2411
+    assert round(speedup(0.9, 4, c), 4) == 2.7301
+    assert round(speedup(0.6, 4, c), 4) == 1.5371
+    assert round(tokens_per_round(0.9, 4), 4) == 4.0951
+    assert round(tokens_per_round(0.6, 4), 4) == 2.3056
+    assert round(tokens_per_round(0.8, 2), 4) == 2.4400
+    assert round(tokens_per_round(0.8, 8), 4) == 4.3289
+    assert round(speedup(0.8, 2, c), 4) == 1.9520
+    assert round(speedup(0.8, 8, c), 4) == 2.1645
+    # the levers, as the box states them
+    assert round(speedup(0.8, 4, c) - speedup(0.6, 4, c), 2) == 0.70
+    assert round(speedup(0.8, 4, c) - speedup(0.8, 8, c), 2) == 0.08
+    assert round(1 / (1 - 0.8), 1) == 5.0
+    # DC-14.2's MTP head
+    assert round(speedup(0.8, 4, 0.05), 4) == 2.8013
+    # limits and break-even
+    assert tokens_per_round(0.8, 0) == 1.0
+    assert round(tokens_per_round(1e-12, 4), 6) == 1.0
+    assert round(tokens_per_round(1 - 1e-12, 4), 6) == 5.0
+    assert round(break_even_c(0.65, 4), 4) == 0.3814
+    assert round(break_even_c(0.8, 4), 4) == 0.5904
+    # E-14.9's Model S variant
+    assert round(speedup(0.85, 4, 0.05), 2) == 3.09
+    assert best_gamma(0.85, 0.05)[0] == 10
+
+
+def test_chapter14_optimal_gamma_and_the_heuristic():
+    """The blueprint says the optimum is 'flat near 3-5 for alpha in
+    [0.7, 0.85]'.  It is 4, 4, 5, 6, and the useful invariant is
+    gamma* ~= 1/(1-alpha), within 20% over [0.5, 0.9]."""
+    from arith.decoding import best_gamma, speedup
+    c = 1 / 8
+    assert [best_gamma(a, c)[0] for a in (0.70, 0.75, 0.80, 0.85)] == [4, 4, 5, 6]
+    assert best_gamma(0.9, c)[0] == 9
+    for a in (0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9):
+        assert abs(best_gamma(a, c)[0] / (1 / (1 - a)) - 1) <= 0.20 + 1e-9
+    # a poor draft is a net loss, not merely a weak win
+    assert speedup(0.5, 8, c) < 1.0
+    assert round(max(speedup(0.5, g, c) for g in range(1, 33)), 2) == 1.40
+
+
+def test_chapter14_acceptance_counter_trap():
+    """accepted/tested is alpha exactly; accepted/drafted is (14.20)'s
+    break-even c, which is a different number and is always smaller."""
+    from arith.decoding import acceptance_counter, break_even_c
+    for a in (0.6, 0.7, 0.8, 0.9):
+        for g in (2, 4, 8):
+            d = acceptance_counter(a, g)
+            assert abs(d["correct_counter"] - a) < 1e-12
+            assert abs(d["naive_counter"] - break_even_c(a, g)) < 1e-12
+    assert round(acceptance_counter(0.8, 4)["naive_counter"], 4) == 0.5904
+    assert round(100 * acceptance_counter(0.8, 4)["understatement"], 1) == 26.2
+    assert round(100 * acceptance_counter(0.8, 8)["understatement"], 1) == 48.0
+
+
+def test_chapter14_bandwidth_per_emitted_token():
+    """The chapter's cost-per-token claim, cashed against Chapter 11's."""
+    from arith.decoding import (bytes_per_emitted_token, verify_intensity_ratio)
+    from arith.model_d import MODEL_D, total_params
+    wb = total_params(MODEL_D) * 2
+    assert round(wb / 1e9, 2) == 16.06
+    assert round(bytes_per_emitted_token(wb, 0.8, 4) / 1e9, 2) == 4.78
+    assert verify_intensity_ratio(4) == 5.0
+
+
+def test_chapter14_temperature_and_truncation():
+    """D-14.1 and the two facts about |S| that Section 14.3 proves."""
+    import numpy as np
+    rng = np.random.default_rng(1402)
+
+    def temper(z, T):
+        w = np.asarray(z, float) / T
+        w = w - w.max()
+        e = np.exp(w)
+        return e / e.sum()
+
+    def H(z, T):
+        p = temper(z, T)
+        nz = p > 0
+        return float(-(p[nz] * np.log(p[nz])).sum())
+
+    z = rng.standard_normal(256) * 2.0
+    # (14.4): the exponent is three, and T**2 agrees only at T = 1
+    for T in (0.3, 0.7, 1.8, 3.0):
+        p = temper(z, T)
+        var = float((p * z ** 2).sum() - (p * z).sum() ** 2)
+        cd = (H(z, T + 1e-6) - H(z, T - 1e-6)) / 2e-6
+        assert abs(cd - var / T ** 3) / cd < 1e-6
+        assert abs(cd - var / T ** 2) / cd > 0.1
+    # (14.7): the gap to log V closes like sigma_z^2 / 2T^2
+    for T in (10.0, 20.0, 50.0):
+        gap = np.log(len(z)) - H(z, T)
+        assert abs(gap / (z.var() / (2 * T ** 2)) - 1) < 0.01
+    # (14.6): a tied argmax gives log m, not zero
+    for m in (2, 3, 5):
+        zt = np.concatenate([np.full(m, 4.0), np.linspace(1.0, -3.0, 20)])
+        assert abs(H(zt, 1e-2) - np.log(m)) < 1e-6
+    # (14.10): the nucleus is monotone in T, for top-p as well as min-p
+    for _ in range(50):
+        zz = rng.standard_normal(512) * rng.uniform(0.5, 4.0)
+        sizes = []
+        for T in np.geomspace(0.1, 8.0, 30):
+            p = np.sort(temper(zz, float(T)))[::-1]
+            sizes.append(int(np.searchsorted(np.cumsum(p), 0.9) + 1))
+        assert all(b >= a for a, b in zip(sizes, sizes[1:]))
+
+
+def test_chapter14_speculative_exactness_and_overlap():
+    """D-14.3, to machine precision and with no assumption on q."""
+    import numpy as np
+    rng = np.random.default_rng(1403)
+    worst_id = worst_ex = 0.0
+    for _ in range(400):
+        V = int(rng.integers(2, 60))
+        p = rng.dirichlet(np.full(V, rng.uniform(0.15, 3.0)))
+        q = rng.dirichlet(np.full(V, rng.uniform(0.15, 3.0)))
+        tv = 0.5 * float(np.abs(p - q).sum())
+        worst_id = max(worst_id,
+                       abs(float(np.minimum(p, q).sum()) - (1 - tv)),
+                       abs(float(np.maximum(q - p, 0).sum()) - tv),
+                       abs(float(np.maximum(p - q, 0).sum()) - tv))
+        emit = np.minimum(p, q) + np.maximum(p - q, 0)
+        worst_ex = max(worst_ex, float(np.abs(emit - p).max()))
+    assert worst_id < 1e-14 and worst_ex < 1e-14
+    # E-14.7, by hand
+    p = np.array([0.5, 0.3, 0.2])
+    q = np.array([0.4, 0.4, 0.2])
+    assert round(0.5 * float(np.abs(p - q).sum()), 4) == 0.1
+    assert round(float(np.minimum(p, q).sum()), 4) == 0.9
+    r = np.maximum(p - q, 0)
+    assert np.allclose(r / r.sum(), [1.0, 0.0, 0.0])
+
+
+def test_chapter14_measured_acceptance_rates():
+    """The real draft-target pair behind Section 14.5's consequence box.
+    Committed as data because it needs two checkpoints to reproduce."""
+    import json
+    import os
+    from arith.decoding import speedup
+    path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "figs", "data", "ch14_acceptance.json")
+    d = json.load(open(path))
+    a = {k: v["alpha"] for k, v in d.items()}
+    assert round(a["prose"], 3) == 0.718
+    assert round(a["code"], 3) == 0.816
+    assert round(a["boilerplate"], 3) == 0.915
+    assert round(max(a.values()) - min(a.values()), 3) == 0.196
+    c = 0.0786
+    sw = max(speedup(v, 4, c) for v in a.values()) - \
+        min(speedup(v, 4, c) for v in a.values())
+    assert round(sw, 2) == 1.02
+    # the plug-in understates on this workload, by 1 to 4 per cent
+    for v in d.values():
+        r = v["tokens_true"] / v["tokens_plugin"] - 1
+        assert 0.005 < r < 0.045
+
+
+# ============================================================ Chapter 15
+def test_chapter15_post_training_memory():
+    """A-15.1, on the book's own Model D rather than a nominal 8e9.  The
+    blueprint prints 288 / 144 / 144-160; those are 8e9 exactly."""
+    from arith.model_d import MODEL_D, total_params
+    from arith.post_training_memory import devices, state_bytes
+    n = total_params(MODEL_D)
+    assert n == 8_030_261_248
+    ppo = state_bytes(n, "PPO")
+    dpo = state_bytes(n, "DPO")
+    grpo = state_bytes(n, "GRPO")
+    assert round(ppo["policy"] / 1e9, 2) == 128.48
+    assert round(ppo["reference"] / 1e9, 2) == 16.06
+    assert round(ppo["value"] / 1e9, 2) == 128.48
+    assert round(ppo["total"] / 1e9, 2) == 289.09
+    assert round(dpo["total"] / 1e9, 2) == 144.54
+    assert round(grpo["total"] / 1e9, 2) == 160.61
+    assert round(state_bytes(n, "GRPO+verifier")["total"] / 1e9, 2) == 144.54
+    # the value network is the policy's size, so PPO is exactly twice DPO
+    assert ppo["total"] / dpo["total"] == 2.0
+    assert round(ppo["total"] / 1e9 / 80, 2) == 3.61
+    # State ALONE fits a four-device node with about 10% to spare.  It is the
+    # 30% that activations and the rollout KV cache need that breaks it, so the
+    # honest device counts carry that headroom.
+    assert ppo["total"] < 4 * 80e9
+    assert devices(ppo["total"], 80, 0.3) == 6
+    assert devices(dpo["total"], 80, 0.3) == 3
+    assert devices(grpo["total"], 80, 0.3) == 3
+    assert devices(ppo["total"], 80, 0.0) == 4
+    # E-15.8, a 70 B dense model with 30% reserved for activations
+    n70 = int(70e9)
+    assert round(state_bytes(n70, "PPO")["total"] / 1e9) == 2520
+    assert devices(state_bytes(n70, "PPO")["total"], 80, 0.3) == 45
+    assert devices(state_bytes(n70, "DPO")["total"], 80, 0.3) == 23
+    assert devices(state_bytes(n70, "GRPO")["total"], 80, 0.3) == 25
+
+
+def test_chapter15_grpo_compute_trade():
+    """E-15.9.  GRPO's crossover is at G = 2, not at some interesting larger
+    number, and the exchange rate at the usual G is what the box prints."""
+    from arith.post_training_memory import compute_per_prompt, grpo_crossover
+    assert compute_per_prompt("PPO") == 18
+    assert compute_per_prompt("GRPO", 8) == 96
+    assert grpo_crossover() == 2 and grpo_crossover(True) == 2
+    assert round(compute_per_prompt("GRPO", 8) / compute_per_prompt("PPO"), 1) == 5.3
+    assert round(compute_per_prompt("GRPO", 16) / compute_per_prompt("PPO"), 1) == 10.7
+
+
+def test_chapter15_rlvr_logit_shift():
+    """Corollary 15.1, and E-15.10."""
+    import math
+    from arith.post_training_memory import (beta_for_target, rlvr_logit_shift,
+                                            rollouts_for_signal)
+    logit = lambda q: math.log(q / (1 - q))
+    for p in (0.01, 0.12, 0.3, 0.6):
+        for beta in (0.2, 0.5019, 2.0):
+            assert logit(rlvr_logit_shift(p, beta)) == pytest.approx(
+                logit(p) + 1 / beta, abs=1e-9)
+    b = beta_for_target(0.12, 0.5)
+    assert round(b, 4) == 0.5019
+    assert rlvr_logit_shift(0.12, b) == pytest.approx(0.5, abs=1e-12)
+    # the same shift, three destinations: this is the corollary's point
+    assert round(rlvr_logit_shift(0.01, b), 3) == 0.069
+    assert round(rlvr_logit_shift(0.6, b), 3) == 0.917
+    # and p = 0 stays 0 at every beta
+    for beta in (0.01, 0.1, 1.0, 100.0):
+        assert rlvr_logit_shift(0.0, beta) == 0.0
+    assert rollouts_for_signal(0.12) == 37
+    assert rollouts_for_signal(0.01) == 459
+    assert rollouts_for_signal(0.0) == -1
+
+
+def test_chapter15_gibbs_identity_and_z_cancellation():
+    """D-15.3 and D-15.4, to machine precision, on random tabular problems."""
+    import numpy as np
+    from scipy.special import logsumexp
+    rng = np.random.default_rng(1501)
+    sig = lambda u: 1.0 / (1.0 + np.exp(-u))
+    worst_id = worst_opt = worst_r = worst_bt = 0.0
+    for _ in range(600):
+        n = int(rng.integers(3, 40))
+        lp = rng.standard_normal(n) * 2.0
+        pref = np.exp(lp - logsumexp(lp))
+        r = rng.standard_normal(n) * rng.uniform(0.5, 3.0)
+        beta = float(rng.uniform(0.1, 4.0))
+        lz = logsumexp(np.log(pref) + r / beta)
+        star = np.exp(np.log(pref) + r / beta - lz)
+        if star.min() <= 0:
+            continue
+        kl = lambda p, q: float((p * np.log(p / q)).sum())
+        pi = rng.dirichlet(np.full(n, rng.uniform(0.4, 3.0)))
+        J = float((pi * r).sum()) - beta * kl(pi, pref)
+        worst_id = max(worst_id, abs(J - (-beta * kl(pi, star) + beta * lz)))
+        Js = float((star * r).sum()) - beta * kl(star, pref)
+        worst_opt = max(worst_opt, J - Js)
+        worst_r = max(worst_r,
+                      float(np.abs(beta * np.log(star / pref) + beta * lz - r).max()))
+        imp = beta * np.log(star / pref)
+        worst_bt = max(worst_bt, float(np.abs(
+            sig(r[:, None] - r[None, :]) - sig(imp[:, None] - imp[None, :])).max()))
+    assert worst_id < 1e-12          # (15.6) is an identity
+    assert worst_opt <= 0.0          # nothing beats pi*
+    assert worst_r < 1e-12           # (15.13) recovers r exactly
+    assert worst_bt < 1e-12          # and dropping beta log Z changes no preference
+
+
+def test_chapter15_group_baseline_is_a_shrinkage():
+    """D-15.5 bias 1.  Not a general O(1/G) perturbation: the direction is
+    exactly right and the magnitude is exactly (G-1)/G."""
+    import numpy as np
+    from scipy.special import logsumexp
+    rng = np.random.default_rng(7)
+    z = rng.standard_normal(6)
+    p = np.exp(z - logsumexp(z))
+    rew = rng.standard_normal(6) * 1.5
+    exact = p * (rew - float((p * rew).sum()))
+    for G in (2, 4, 8, 16):
+        rs = np.random.default_rng(1000 + G)
+        y = rs.choice(6, (150_000, G), p=p)
+        r = rew[y]
+        grads = np.eye(6)[y] - p
+        est = (((r - r.mean(1, keepdims=True))[:, :, None] * grads).sum(1) / G).mean(0)
+        assert np.linalg.norm(est) / np.linalg.norm(exact) == pytest.approx(
+            (G - 1) / G, abs=0.01)
+        cos = est @ exact / np.linalg.norm(est) / np.linalg.norm(exact)
+        assert cos == pytest.approx(1.0, abs=1e-3)
+
+
+def test_chapter15_inverse_sigma_weighting():
+    """D-15.5 bias 2.  The blueprint's notebook asserts w(0.05)/w(0.5) > 4,
+    which is false; 4.59 is w(0.05) itself."""
+    import math
+    w = lambda p: 1.0 / math.sqrt(p * (1 - p))
+    assert w(0.5) == 2.0
+    assert round(w(0.05), 3) == 4.588
+    assert round(w(0.01), 3) == 10.050
+    assert round(w(0.05) / w(0.5), 3) == 2.294
+    assert w(0.05) > 4.0                    # what the prose actually claims
+    assert w(0.05) / w(0.5) < 4.0           # what the notebook claimed
+    assert min(w(p) for p in (0.1, 0.3, 0.5, 0.7, 0.9)) == w(0.5)
+
+
+def test_chapter15_gspo_sequence_ratio():
+    """E-15.7, and the variance laws of E-15.14."""
+    import math
+    import numpy as np
+    for L, want in ((512, 1.0078), (32, 1.1331)):
+        assert round(math.exp(4.0) ** (1 / L), 4) == want
+    assert round(math.exp(4.0), 1) == 54.6
+    assert min(math.exp(4.0), 1.2) == 1.2
+    rng = np.random.default_rng(1514)
+    for L in (32, 128):
+        f = (rng.random((120_000, L)) < 0.01) * 4.0
+        assert f[:, 0].var() / (f.sum(1) / L).var() == pytest.approx(L, rel=0.08)
+
+
+# ============================================================ Chapter 16
+def test_chapter16_sae_sizing():
+    """A-16.1.  The only arithmetic box in Part IV that needed no correction."""
+    from arith.model_d import MODEL_D
+    from arith.sae_capacity import (capacity, eps_for, layer_params,
+                                    sae_params, sustainable_l0)
+    d = MODEL_D.d
+    assert d == 4096
+    p = sae_params(d, 32)
+    assert p["m"] == 131_072
+    assert p["W_enc"] == 536_870_912 and p["W_dec"] == 536_870_912
+    assert p["total"] == 1_073_876_992
+    assert 2 * (p["W_enc"] + p["W_dec"]) == 2 * (1 << 30)      # exactly 2 GiB
+    assert round(16 * p["total"] / 1e9, 1) == 17.2
+    lay = layer_params()
+    assert round(lay / 1e6, 1) == 218.1
+    assert round(p["total"] / lay, 2) == 4.92
+    assert round(32 * p["total"] / 1e9, 1) == 34.4
+    assert round(32 * p["total"] / 6.98e9, 1) == 4.9
+    assert round(capacity(d, 0.1)) == 28_001
+    assert round(p["m"] / capacity(d, 0.1), 2) == 4.68
+    assert round(eps_for(d, p["m"]), 6) == 0.107272
+    assert round(sustainable_l0(d, p["m"]), 1) == 86.9
+
+
+def test_chapter16_capacity_and_its_limits():
+    """D-16.2, M-16.1, and the range over which the bound is vacuous."""
+    import math
+    from arith.sae_capacity import capacity, eps_for, sustainable_l0
+    d = 4096
+    assert round(capacity(d, 0.05), 1) == 12.9
+    assert capacity(d, 0.05) < d                     # vacuous, not merely loose
+    eps_vac = math.sqrt(4 * math.log(d) / d)
+    assert round(eps_vac, 4) == 0.0901
+    assert capacity(d, eps_vac) == pytest.approx(d, rel=1e-9)
+    assert round(capacity(d, 0.1) / d, 2) == 6.84    # under seven times d
+    # quadratic sensitivity: ln m moves by 1 for this change in eps
+    assert round(2 / (d * 0.1), 5) == 0.00488
+    # the sustainable L0 at three widths
+    assert round(sustainable_l0(d, 32_768), 1) == 98.5
+    assert round(sustainable_l0(d, 524_288), 1) == 77.8
+    # Model S, E-16.7
+    assert round(eps_for(7168, 32 * 7168), 4) == 0.0830
+
+
+def test_chapter16_interference_law():
+    """D-16.3 step 6.  The interference standard deviation is sqrt((k-1)/d)
+    exactly, which is why the blueprint's AUC target at k = 200 is unreachable."""
+    import math
+    import numpy as np
+    rng = np.random.default_rng(1602)
+    d, m = 4096, 8192
+    U = rng.standard_normal((m, d))
+    U /= np.linalg.norm(U, axis=1, keepdims=True)
+    for k, want in ((10, 0.050), (50, 0.111), (200, 0.222)):
+        idx = rng.choice(m, k, replace=False)
+        x = np.ones(k) @ U[idx]
+        r = U @ x
+        mask = np.zeros(m, bool)
+        mask[idx] = True
+        assert r[~mask].std() == pytest.approx(math.sqrt(k / d), rel=0.08)
+        assert round(r[~mask].std(), 2) == round(want, 2)
+        sep = (r[mask].mean() - r[~mask].mean()) / r[~mask].std()
+        assert sep == pytest.approx(math.sqrt(d / k), rel=0.15)
+    # so at k = 200 the separation is still about 4.5 sigma, not an AUC of 0.75
+    assert math.sqrt(d / 200) > 4.0
+    # an AUC near 0.75 would need k of this order, more than twice d
+    assert d / 0.67 ** 2 > 2 * d
+
+
+def test_chapter16_worst_case_and_random_sign_limits():
+    """(16.12) against (16.13): random signs buy a square."""
+    eps, kappa = 0.1, 1.0
+    assert 0.5 * (1 + 1 / (eps * kappa)) == pytest.approx(5.5)
+    assert 1 / (eps * kappa) ** 2 == pytest.approx(100.0)
+    for kap, want in ((1.0, 5.5), (1.5, 3.8333), (3.0, 2.1667)):
+        assert round(0.5 * (1 + 1 / (0.1 * kap)), 4) == want
+
+
+def test_chapter16_shrinkage_is_lambda_over_two():
+    """D-16.4, and the k-independence of (16.18)."""
+    import numpy as np
+    from arith.sae_capacity import soft_threshold_deficit
+    rng = np.random.default_rng(1603)
+    lam = 0.4
+    c = rng.standard_normal(300_000)
+    z = np.sign(c) * np.maximum(np.abs(c) - lam / 2, 0.0)
+    act = z != 0
+    assert (np.abs(c[act]) - np.abs(z[act])).mean() == pytest.approx(lam / 2,
+                                                                     abs=1e-9)
+    assert soft_threshold_deficit(lam, 1.0) == pytest.approx(0.8)
+    for k in (3, 10, 40, 200):
+        cs = np.full(k, 1.0)
+        r = float(np.sqrt(((cs - lam / 2) ** 2).sum() / (cs ** 2).sum()))
+        assert r == pytest.approx(soft_threshold_deficit(lam, 1.0), abs=1e-12)
