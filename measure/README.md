@@ -5,7 +5,7 @@ Three figures depend on statistics of a trained model rather than on arithmetic:
 | Figure | Chapter | The claim under test |
 |---|---|---|
 | F-2.4 | 2 | The embedding cloud carries an offset large enough to dominate any cosine computed without removing it |
-| F-3.6 | 3 | Attention mass concentrates on position 0 for queries with no strong match |
+| F-3.5 | 3 | Attention mass concentrates on position 0 for queries with no strong match |
 | F-5.1 | 5 | `|mean(x)| / RMS(x)` of the residual stream is O(10⁻²) at every layer |
 
 None of the three can go into print until the measurement exists. Chapter 5's
@@ -107,7 +107,7 @@ run anywhere and real enough to test the code path:
 
     F-2.4  raw off-diagonal cosine 0.245 -> mean-centred 0.124
     F-5.1  61 norm sites (= 2 x 30 + 1), median rho from 0.0172 to 0.0417
-    F-3.6  layer 8: position-0 share 13.2%, row-sum error 1.8e-07
+    F-3.5  layer 8: position-0 share 13.2%, row-sum error 1.8e-07
 
 Two things to take from that. Chapter 5's claim survives: ρ is O(10⁻²) at every
 site, on a real model. And Chapter 2's claim needs strengthening, which is the

@@ -1,0 +1,375 @@
+"""Chapter 6 — The Feed-Forward Block.
+
+Generated into `notebooks/ch06_ffn.ipynb` by `build_all.py`.  Sections 1 to 4
+are cited by number from the chapter's margin notes, so they may be added to
+but never renumbered.
+"""
+from __future__ import annotations
+
+CHAPTER = 6
+SLUG = "ffn"
+TITLE = "The Feed-Forward Block"
+BLURB = (
+    "The FFN read as a key-value memory, GeLU read as an expectation, and the "
+    "one line of algebra that shows gating is a change of function class rather "
+    "than a change of activation. Then where 14336 comes from."
+)
+
+# ---------------------------------------------------------------------------
+S1 = r'''
+from scipy.special import ndtr
+
+SEED = 6001
+rng = np.random.default_rng(SEED)
+d, d_ff = 64, 176          # Model D's aspect ratio at 1/64 scale
+
+W_up = rng.standard_normal((d, d_ff)) / np.sqrt(d)
+W_down = rng.standard_normal((d_ff, d)) / np.sqrt(d_ff)
+
+
+def gelu(z):
+    return z * ndtr(z)
+
+
+x = rng.standard_normal(d) * 1.2
+
+# Equation (6.1) as written, and equation (6.4) as a sum over units.
+direct = gelu(x @ W_up) @ W_down
+
+k = [W_up[:, j] for j in range(d_ff)]        # keys are COLUMNS of the up matrix
+v = [W_down[j, :] for j in range(d_ff)]      # values are ROWS of the down matrix
+summed = np.zeros(d)
+for j in range(d_ff):
+    summed += gelu(x @ k[j]) * v[j]
+assert np.abs(direct - summed).max() < 1e-12, np.abs(direct - summed).max()
+print("FFN(x) as one matmul pair and as a sum over %d units: max abs %.2e"
+      % (d_ff, np.abs(direct - summed).max()))
+
+# Step 1: the pre-activation of unit j is an inner product and nothing else, so
+# no unit sees another unit's score.
+pre = x @ W_up
+assert np.abs(pre - np.array([x @ kj for kj in k])).max() < 1e-13
+u = rng.standard_normal(d)
+u -= (u @ k[7]) / (k[7] @ k[7]) * k[7]                 # a direction unit 7 cannot see
+moved = x + 5.0 * u
+assert abs(gelu(moved @ k[7]) - gelu(x @ k[7])) < 1e-12
+assert np.abs(gelu(moved @ W_up) - gelu(pre)).max() > 1.0   # other units do move
+
+# Step 4: the score is a similarity up to two norms the unit does not control.
+cos = np.array([(x @ kj) / (np.linalg.norm(x) * np.linalg.norm(kj)) for kj in k])
+assert np.abs(pre - np.linalg.norm(x) * np.array([np.linalg.norm(kj) for kj in k])
+              * cos).max() < 1e-12
+
+# Step 5: an FFN can return nothing, an attention head cannot.  With ReLU and a
+# stream orthogonal enough to every key, the layer writes exactly zero; a
+# softmax row always spends one full unit of mass.
+relu = lambda z: np.maximum(z, 0.0)
+worst = -np.abs(rng.standard_normal(d_ff)) - 1.0        # every score below zero
+assert np.abs(relu(worst) @ W_down).max() == 0.0
+scores = rng.standard_normal(24) * 8
+p = np.exp(scores - scores.max()); p /= p.sum()
+assert abs(p.sum() - 1.0) < 1e-14 and p.max() > 0.0
+
+# Sparsity is a measurement here and not an assertion: how many units clear a
+# threshold on one token, and how much of the output they carry.
+act = gelu(pre)
+order = np.argsort(-np.abs(act))
+share = np.cumsum(np.abs(act)[order]) / np.abs(act).sum()
+top = int(np.searchsorted(share, 0.9)) + 1
+print("%d of %d units carry 90%% of the total activation mass on this token"
+      % (top, d_ff))
+
+# The failure mode, as a counting fact rather than an opinion: there are more
+# keys than dimensions, so they cannot be mutually orthogonal.
+assert d_ff > d
+gram = np.abs(np.corrcoef(W_up.T))
+np.fill_diagonal(gram, 0.0)
+assert gram.max() > 0.1, "some pair of keys must overlap"
+print("largest |cos| between two of the %d keys in %d dimensions: %.3f"
+      % (d_ff, d, gram.max()))
+'''
+
+S2 = r'''
+from scipy.special import ndtr
+from scipy.optimize import brentq
+
+SEED = 6002
+rng = np.random.default_rng(SEED)
+
+
+def gelu(z):
+    return z * ndtr(z)
+
+
+def dgelu(z):                       # equation (6.6)
+    return ndtr(z) + z * np.exp(-z * z / 2) / np.sqrt(2 * np.pi)
+
+
+def gelu_tanh(z):                   # equation (6.7)
+    return 0.5 * z * (1 + np.tanh(np.sqrt(2 / np.pi) * (z + 0.044715 * z ** 3)))
+
+
+# Steps 1 and 2: GeLU is the mean of a stochastic gate whose keep-probability
+# is set by the input.  Monte Carlo, so the check is against sampling error.
+n = 2_000_000
+Z = rng.standard_normal(n)
+for x in (-1.3, -0.2, 0.6, 2.0):
+    gated = x * (Z <= x)
+    se = gated.std() / np.sqrt(n)
+    assert abs(gated.mean() - gelu(x)) < 4 * se + 1e-12, x
+print("E[x 1{Z <= x}] matches x Phi(x) to Monte-Carlo error at four points")
+
+# Step 3: the derivative, against a central difference.
+h, xs = 1e-6, np.linspace(-6, 6, 241)
+fd = (gelu(xs + h) - gelu(xs - h)) / (2 * h)
+assert np.abs(fd - dgelu(xs)).max() < 1e-9, np.abs(fd - dgelu(xs)).max()
+
+# Step 4: the expansion at the origin.  The quadratic coefficient is what §6.3
+# calls c_phi for an ungated unit.
+assert abs(dgelu(0.0) - 0.5) < 1e-15
+d2 = (gelu(h) - 2 * gelu(0.0) + gelu(-h)) / h ** 2
+assert abs(d2 - np.sqrt(2 / np.pi)) < 1e-4
+c_phi = 0.5 * np.sqrt(2 / np.pi)
+assert abs(c_phi - 1 / np.sqrt(2 * np.pi)) < 1e-15
+assert round(c_phi, 4) == 0.3989
+
+# Step 5: GeLU is not monotone.  The root of the derivative, found rather than
+# quoted, and the minimum value there.
+xmin = brentq(dgelu, -3.0, -0.1, xtol=1e-14)
+assert abs(xmin - (-0.751792)) < 1e-6, xmin
+assert abs(gelu(xmin) - (-0.169971)) < 1e-6, gelu(xmin)
+assert round(gelu(xmin), 4) == -0.1700 and round(xmin, 4) == -0.7518
+left = np.linspace(-4, xmin - 1e-3, 500)
+assert (dgelu(left) < 0).all(), "GeLU decreases to the left of its minimum"
+assert gelu(-2.0) > gelu(xmin) and gelu(-0.1) > gelu(xmin)
+print("GeLU minimum %.6f at x = %.6f, so a larger pre-activation can mean a "
+      "smaller output" % (gelu(xmin), xmin))
+
+# Step 6: the tanh form, and how far it is from the exact one.
+grid = np.linspace(-8, 8, 2_000_001)
+err = np.abs(gelu(grid) - gelu_tanh(grid))
+i = int(err.argmax())
+assert err.max() < 1e-3
+assert abs(err.max() - 4.73e-4) < 1e-5, err.max()
+assert abs(abs(grid[i]) - 2.699) < 1e-3, grid[i]
+ulp_bf16 = 2.0 ** -8                    # one ulp near 1 in bf16: 8 mantissa bits
+assert abs(ulp_bf16 - 3.91e-3) < 1e-5
+assert err.max() / ulp_bf16 < 0.2
+print("max |exact - tanh| on [-8, 8] is %.3e at |x| = %.3f, about %.2f of a "
+      "bf16 ulp near 1" % (err.max(), abs(grid[i]), err.max() / ulp_bf16))
+'''
+
+S3 = r'''
+SEED = 6003
+rng = np.random.default_rng(SEED)
+d = 12
+
+
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def swish(z, beta=1.0):
+    return z * sigmoid(beta * z)
+
+
+w = rng.standard_normal(d)
+v = rng.standard_normal(d)
+
+# Equation (6.11): the quadratic form is exact, and the leading term of a gated
+# unit is that form halved.  Check the small-x limit at the stated rate.
+M = np.outer(w, v)
+x0 = rng.standard_normal(d)
+x0 /= np.linalg.norm(x0)
+for t in (1e-1, 1e-2, 1e-3):
+    x = t * x0
+    exact = swish(x @ w) * (x @ v)
+    quad = 0.5 * (x @ M @ x)
+    assert abs((x @ w) * (x @ v) - x @ M @ x) < 1e-13    # (6.11), exactly
+    assert abs(exact - quad) < 0.2 * t ** 3, (t, abs(exact - quad))
+print("gated unit minus its quadratic part falls as t^3: %.2e, %.2e, %.2e"
+      % tuple(abs(swish((t * x0) @ w) * ((t * x0) @ v)
+                  - 0.5 * ((t * x0) @ M @ (t * x0))) for t in (1e-1, 1e-2, 1e-3)))
+
+# Step 2: only the symmetric part survives, and it is a saddle.
+S = 0.5 * (M + M.T)
+for _ in range(50):
+    z = rng.standard_normal(d)
+    assert abs(z @ M @ z - z @ S @ z) < 1e-12
+ev = np.linalg.eigvalsh(S)
+assert np.abs(w / np.linalg.norm(w) - v / np.linalg.norm(v)).max() > 1e-3
+assert ev[0] < -1e-9 < 1e-9 < ev[-1], ev
+assert np.linalg.matrix_rank(S, tol=1e-10) == 2
+
+# Step 3: an ungated unit's degree-2 matrix is a square, symmetric and PSD, so
+# it has one nodal line where the gated one has two.
+kk = np.outer(w, w)
+assert np.abs(kk - kk.T).max() < 1e-14
+assert np.linalg.eigvalsh(kk).min() > -1e-12
+assert np.linalg.matrix_rank(kk, tol=1e-10) == 1
+
+# The Hessian at the origin, numerically, is the claim rather than the algebra.
+def gated(x):
+    return swish(x @ w) * (x @ v)
+
+
+h = 1e-4
+H = np.empty((d, d))
+for i in range(d):
+    for j in range(d):
+        ei = np.zeros(d); ei[i] = h
+        ej = np.zeros(d); ej[j] = h
+        H[i, j] = (gated(ei + ej) - gated(ei - ej)
+                   - gated(-ei + ej) + gated(-ei - ej)) / (4 * h * h)
+assert np.abs(H - S).max() < 1e-5, np.abs(H - S).max()
+print("gated unit Hessian at the origin vs (w v^T + v w^T)/2: max abs %.2e"
+      % np.abs(H - S).max())
+
+# Step 4: polarisation, exactly.
+for _ in range(50):
+    z = rng.standard_normal(d)
+    lhs = (z @ w) * (z @ v)
+    rhs = 0.25 * ((z @ (w + v)) ** 2 - (z @ (w - v)) ** 2)
+    assert abs(lhs - rhs) < 1e-12
+assert np.abs(M + M.T - 0.5 * (np.outer(w + v, w + v)
+                               - np.outer(w - v, w - v))).max() < 1e-12
+
+# Step 5: two ungated units reproduce one gated unit's degree-2 term exactly,
+# with c_phi the activation's own second-order coefficient.
+c_phi = 1 / np.sqrt(2 * np.pi)              # GeLU, from D-6.2 step 4
+lam = 1 / (8 * c_phi)
+kp, km = w + v, w - v
+for _ in range(50):
+    z = rng.standard_normal(d)
+    two_units = lam * c_phi * ((z @ kp) ** 2 - (z @ km) ** 2)
+    assert abs(two_units - 0.5 * (z @ w) * (z @ v)) < 1e-12
+assert abs(1 / (8 * (0.25)) - 0.5) < 1e-15          # Swish_1 ungated: c_phi = beta/4
+
+# Step 6: the rank-2 eigen-pairing of equation (6.17), and the factor of two in
+# reachable Hessian rank.
+Q, _ = np.linalg.qr(rng.standard_normal((d, 2)))
+up, uq = Q[:, 0], Q[:, 1]
+a, b = 1.3, 0.7
+wp, vp = a * up + b * uq, a * up - b * uq
+pair = 0.5 * (np.outer(wp, vp) + np.outer(vp, wp))
+target = a * a * np.outer(up, up) - b * b * np.outer(uq, uq)
+assert np.abs(pair - target).max() < 1e-12
+ep = np.linalg.eigvalsh(pair)
+assert abs(ep[0] + b * b) < 1e-12 and abs(ep[-1] - a * a) < 1e-12
+
+n = 4
+gated_layer = sum(0.5 * (np.outer(wi, vi) + np.outer(vi, wi))
+                  for wi, vi in zip(rng.standard_normal((n, d)),
+                                    rng.standard_normal((n, d))))
+ungated_layer = sum(np.outer(ki, ki) for ki in rng.standard_normal((n, d)))
+assert np.linalg.matrix_rank(gated_layer, tol=1e-10) == 2 * n
+assert np.linalg.matrix_rank(ungated_layer, tol=1e-10) == n
+assert np.linalg.eigvalsh(ungated_layer).min() > -1e-10      # PSD, so no saddles
+assert np.linalg.eigvalsh(gated_layer).min() < -1e-6
+print("width-%d layer Hessian rank: gated %d, ungated %d, and only the gated "
+      "one reaches negative eigenvalues"
+      % (n, np.linalg.matrix_rank(gated_layer, tol=1e-10),
+         np.linalg.matrix_rank(ungated_layer, tol=1e-10)))
+'''
+
+S4 = r'''
+from arith.model_d import (MODEL_D, ffn_budget, llama_intermediate_size,
+                           non_embedding, attention_params, per_layer)
+
+SEED = 6004
+rng = np.random.default_rng(SEED)
+c = MODEL_D
+b = ffn_budget(c)
+
+# Steps 1 and 2 of D-6.4: equate the two parameter counts and d cancels, so the
+# ratio is the same at every width.  Checked at four real ones and at fifty
+# random ones, because "d cancels" is a claim about all of them.
+widths = list((512, 4096, 8192, 16384)) + list(rng.integers(64, 40_000, 50))
+for d in widths:
+    d = int(d)
+    d_ff = 4 * d
+    assert 3 * d * (2 * d_ff // 3) <= 2 * d * d_ff
+    assert abs(3 * d * (2 * d_ff // 3) - 2 * d * d_ff) <= 3 * d
+    assert (2 * d_ff // 3) / d_ff <= 2 / 3 < (2 * d_ff // 3 + 1) / d_ff
+    assert abs((2 * d_ff / 3) / d - 8 / 3) < 1e-12          # the ratio, at any d
+assert abs(8 / 3 - 2.667) < 1e-3
+
+# The arithmetic box, all five steps, with every number from arith/model_d.py.
+assert b["ungated_4d_params"] == 2 * c.d * (4 * c.d) == 134_217_728
+assert b["d_ff_two_thirds"] == int(2 * (4 * c.d) / 3) == 10_922
+assert b["gated_two_thirds_params"] == 3 * c.d * b["d_ff_two_thirds"] == 134_209_536
+residue = b["ungated_4d_params"] - b["gated_two_thirds_params"]
+assert residue == 8_192 == 2 * c.d, "the residue is integer rounding, nothing more"
+assert round(100 * residue / b["ungated_4d_params"], 3) == 0.006
+
+p = llama_intermediate_size(c.d)
+assert (p["4d"], p["two_thirds"], p["multiplied"]) == (16_384, 10_922, 14_198)
+assert p["intermediate_size"] == 14_336 == c.d_ff
+assert round(p["ratio_to_two_thirds"], 4) == 1.3125
+assert llama_intermediate_size(8_192)["intermediate_size"] == 28_672   # the 70B check
+assert 14_336 % 1024 == 0 and 14_336 % 256 == 0        # rounding folklore, tested
+print("4d %d -> two-thirds %d -> x1.3 %d -> rounded up %d"
+      % (p["4d"], p["two_thirds"], p["multiplied"], p["intermediate_size"]))
+
+# Step 4 of D-6.4: FLOPs match, activation memory does not.  Four thirds.
+assert abs(2 * b["d_ff_two_thirds"] / (4 * c.d) - 4 / 3) < 1e-3
+assert round(2 * b["d_ff_two_thirds"] / (4 * c.d), 4) == 1.3333
+print("activation memory ratio at matched parameters and matched FLOPs: %.4f"
+      % (2 * b["d_ff_two_thirds"] / (4 * c.d)))
+
+# Step 5 of the box: where the parameters actually are.  Recomputed from the
+# hyperparameters and compared against non_embedding(), not against the page.
+mlp_per_layer = 3 * c.d * c.d_ff
+attn_per_layer = sum(attention_params(c).values())
+scratch = (mlp_per_layer + attn_per_layer + 2 * c.d) * c.L + c.d
+assert scratch == non_embedding(c) == b["non_embedding"] == 6_979_588_096
+assert mlp_per_layer == 176_160_768 and b["mlp_total"] == 5_637_144_576
+assert attn_per_layer == 41_943_040 and b["attn_total"] == 1_342_177_280
+assert abs(scratch / 6.9796e9 - 1) < 1e-3
+share = b["mlp_total"] / scratch
+assert abs(share - 0.808) < 1e-3 and round(100 * share, 1) == 80.8
+assert per_layer(c)["total"] == mlp_per_layer + attn_per_layer + 2 * c.d
+
+# and what the 1.3x costs, which is the honest reading of "two-thirds".
+assert b["non_embedding_two_thirds"] == 5_637_148_672
+assert b["saving"] == scratch - b["non_embedding_two_thirds"] == 1_342_439_424
+assert round(100 * b["saving_frac"], 1) == 19.2
+print("FFN share %.3f of %d non-embedding parameters; the 1.3x multiplier "
+      "costs %.1f%% of the model" % (share, scratch, 100 * b["saving_frac"]))
+'''
+
+SECTIONS = [
+    ("1", "The FFN is a key-value memory",
+     "Equation (6.4) is a change of variables, not a theorem: the columns of "
+     "the up-projection are keys, the rows of the down-projection are values, "
+     "and the layer is a sum over units of one scalar read times one written "
+     "direction. The cell verifies the two forms agree, checks that a unit's "
+     "score is an inner product and nothing else, and measures how many units "
+     "actually carry the output on one token (a measurement, so it is printed "
+     "rather than asserted).",
+     S1),
+    ("2", "GeLU as the expectation of a stochastic gate",
+     "GeLU is x times the probability that a standard normal falls below x, "
+     "which is the mean of a gate whose keep-probability the input sets itself. "
+     "The cell checks that expectation by Monte Carlo, differentiates against a "
+     "central difference, locates the minimum by root-finding rather than "
+     "quoting it (this is the non-monotone region Chapter 7 needs), and prices "
+     "the tanh approximation against one unit in the last place of bf16.",
+     S2),
+    ("3", "A gated unit is a rank-1 bilinear form, an ungated unit a symmetric one",
+     "The point of gating is visible at second order. A gated unit contributes "
+     "an arbitrary rank-1 matrix, whose symmetric part is a saddle, while an "
+     "ungated unit can only contribute a square and is therefore sign-definite. "
+     "The cell measures the gated unit's Hessian at the origin numerically, "
+     "checks the polarisation identity that converts one into two, and confirms "
+     "the factor of two in reachable Hessian rank.",
+     S3),
+    ("4", "The two-thirds parameter-matching identity",
+     "Two matrices at width d_ff hold as many parameters as three at two-thirds "
+     "of it, and d cancels, which is why one ratio has survived from small "
+     "models to large ones. The cell checks the identity to the integer "
+     "rounding it predicts, walks the four lines of the Llama width recipe that "
+     "turn 10922 into 14336, and shows the one place the matching fails, which "
+     "is activation memory at four thirds.",
+     S4),
+]
